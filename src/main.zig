@@ -622,17 +622,133 @@ const PushConstant = packed struct {
 
 var is_mouse_button_down: bool = false;
 
+const WindowEdge = enum (win.WPARAM) {
+    left = 1,
+    right = 2,
+    top = 3,
+    top_left = 4,
+    top_right = 5,
+    bottom = 6,
+    bottom_left = 7,
+    bottom_right = 8,
+};
+
+const Point = extern struct {
+    x: i32,
+    y: i32,
+};
+
+const MinMaxInfo = extern struct {
+    reserved: Point,
+    max_size: Point,
+    max_position: Point,
+    min_track_size: Point,
+    max_track_size: Point,
+};
+
+var wm_timer_id: win.UINT_PTR = undefined;
+
+fn timerCallback(hWnd: win.HWND, message: win.UINT, idTimer: win.UINT_PTR, dwTime: win.DWORD)callconv(win.WINAPI) void {
+    _ = hWnd;
+    _ = message;
+    _ = idTimer;
+    _ = dwTime;
+    if(framebuffer_resized) {
+        processFrame(default_allocator, &graphics_context) catch |err| {
+            std.log.warn("Failed to process frame. Error: {}", .{err});
+            return;
+        };
+    }
+}
+
 fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.C) win.LRESULT {
     switch (umessage) {
+        // user32.WM_MOUSEACTIVATE => std.log.info("WM_MOUSEACTIVATE", .{}),
+        user32.WM_CAPTURECHANGED => {
+            // is_mouse_in_screen = false;
+            std.log.info("WM_CAPTURECHANGED", .{});
+        },
+        user32.WM_TIMER => {
+            std.log.info("Timer tick", .{});
+            std.debug.assert(false);
+            // return 0;
+        },
+        user32.WM_SETFOCUS => std.log.info("WM_SETFOCUS", .{}),
+        user32.WM_KILLFOCUS => std.log.info("WM_KILLFOCUS", .{}),
+        // user32.WM_SYSCOMMAND => std.log.info("WM_SYSCOMMAND", .{}),
+        user32.WM_CLOSE => std.log.info("WM_CLOSE", .{}),
+        user32.WM_INPUTLANGCHANGE => std.log.info("WM_INPUTLANGCHANGE", .{}),
+        user32.WM_CHAR, user32.WM_SYSCHAR => std.log.info("WM_CHAR, WM_SYSCHAR", .{}),
+        user32.WM_UNICHAR => std.log.info("WM_UNICHAR", .{}),
+        user32.WM_KEYDOWN, user32.WM_SYSKEYDOWN, user32.WM_KEYUP, user32.WM_SYSKEYUP => std.log.info("user32.WM_KEYDOWN, user32.WM_SYSKEYDOWN, user32.WM_KEYUP, user32.WM_SYSKEYUP", .{}),
+        user32.WM_INPUT => std.log.info("WM_INPUT", .{}),
+        user32.WM_MOUSELEAVE => std.log.info("WM_MOUSELEAVE", .{}),
+        user32.WM_MOUSEWHEEL => std.log.info("WM_MOUSEWHEEL", .{}),
+        user32.WM_MOUSEHWHEEL => std.log.info("WM_MOUSEHWHEEL", .{}),
+        user32.WM_ENTERSIZEMOVE => {
+            std.log.info("WM_ENTERSIZEMOVE", .{});
+            //
+            // Drop back to about 30fps
+            //
+            const time_interval_ms: win.UINT = 33;
+            wm_timer_id = user32.setTimer(null, 0, time_interval_ms, &timerCallback) catch |err| {
+                std.log.err("Failed to set timer. Err: {}", .{err});
+                return 0;
+            };
+            return 0;
+        },
+        user32.WM_ENTERMENULOOP => std.log.info("WM_ENTERMENULOOP", .{}),
+        user32.WM_EXITSIZEMOVE => {
+            std.log.info("WM_EXITSIZEMOVE", .{});
+            user32.killTimer(null, wm_timer_id) catch |err| {
+                std.log.info("Failed to fill wm timer. Error: {}", .{err});
+            };
+            return 0;
+        },
+        user32.WM_EXITMENULOOP => std.log.info("WM_EXITMENULOOP", .{}),
+        user32.WM_MOVE => std.log.info("WM_MOVE", .{}),
+        user32.WM_SIZING => {
+            if(wparam >= 1 and wparam <= 8) {
+                const window_edge: WindowEdge = @enumFromInt(wparam);
+                _ = window_edge;
+                // std.log.info("WM_SIZING edge: {}", .{window_edge});
+            } else {
+                std.log.info("Invalid window edge: {d}", .{wparam});
+            }
+            return 1;
+        },
+        user32.WM_GETMINMAXINFO => {
+            const info: *MinMaxInfo = @ptrFromInt(@as(usize, @intCast(lparam)));
+            _ = info;
+            // std.log.info("WM_GETMINMAXINFO", .{});
+            // std.log.info("min_track_size: ({d}, {d})", .{ info.min_track_size.x, info.min_track_size.y});
+        },
+        // user32.WM_PAINT => std.log.info("WM_PAINT", .{}),
+        user32.WM_ERASEBKGND => {
+            std.log.info("WM_ERASEBKGND", .{});
+            return 1;
+        },
+        // user32.WM_NCACTIVATE => std.log.info("WM_NCACTIVATE", .{}),
+        // user32.WM_NCPAINT => std.log.info("WM_NCPAINT", .{}),
+        // user32.WM_DWMCOMPOSITIONCHANGED => std.log.info("WM_DWMCOMPOSITIONCHANGED", .{}),
+        // user32.WM_DWMCOLORIZATIONCOLORCHANGED => std.log.info("WM_DWMCOLORIZATIONCOLORCHANGED", .{}),
+        // user32.WM_GETDPISCALEDSIZE => std.log.info("WM_GETDPISCALEDSIZE", .{}),
+        // user32.WM_DPICHANGED => std.log.info("WM_DPICHANGED", .{}),
+        // user32.WM_SETCURSOR => {
+        //     std.log.info("WM_SETCURSOR", .{});
+        //     return 1;
+        // },
+        user32.WM_DROPFILES => std.log.info("WM_DROPFILES", .{}),
         user32.WM_DESTROY => {
             user32.postQuitMessage(0);
             return 0;
         },
-        user32.WM_CHAR => {
-            std.log.info("Char pressed: {d}", .{wparam});
-        },
+        // user32.WM_CHAR => {
+        //     std.log.info("Char pressed: {d}", .{wparam});
+        // },
         user32.WM_MOUSEACTIVATE => {
             std.log.info("Window activated", .{});
+            return 0;
         },
         user32.WM_LBUTTONUP => {
             std.log.info("Mouse button released", .{});
@@ -642,9 +758,11 @@ fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam
             }
             std.log.info("Mouse clicked!", .{});
             is_mouse_button_down = false;
+            return 0;
         },
         user32.WM_LBUTTONDOWN => {
             is_mouse_button_down = true;
+            return 0;
         },
         user32.WM_MOUSEMOVE => {
             const x: i32 = @intCast(lparam & @as(isize, 0xfff));
@@ -654,9 +772,10 @@ fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam
                 .y = @floatFromInt(y),
             };
             // std.log.info("Mouse: {d} x {d}", .{ x, y });
+            return 0;
         },
         user32.WM_SIZE => {
-            // std.log.info("Window resizing", .{});
+            std.log.info("Window resizing", .{});
             framebuffer_resized = true;
             const width: i32 = @intCast(lparam & @as(isize, 0xfff));
             const height: i32 = @intCast((lparam >> 16) & @as(isize, 0xffff));
@@ -664,14 +783,21 @@ fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam
                 .width = @intCast(width),
                 .height = @intCast(height),
             };
+            return 0;
         },
-        else => return user32.defWindowProcA(hwnd, umessage, wparam, lparam),
+        else => {
+            std.log.info("Unknown event..", .{});
+            // return user32.defWindowProcW(hwnd, umessage, wparam, lparam);
+        }
     }
-    return 0;
+    return user32.defWindowProcW(hwnd, umessage, wparam, lparam);
+    // return 0;
 }
 
 var app_hinstance: win.HINSTANCE = undefined;
 var window_handle: win.HWND = undefined;
+var default_allocator: std.mem.Allocator = undefined;
+var graphics_context: GraphicsContext = undefined;
 
 pub fn wWinMain(hinstance: win.HINSTANCE, prev_instance: ?win.HINSTANCE, cmd_line: win.PWSTR, cmd_show_count: win.INT) win.INT {
     _ = cmd_line;
@@ -681,10 +807,10 @@ pub fn wWinMain(hinstance: win.HINSTANCE, prev_instance: ?win.HINSTANCE, cmd_lin
 
     const class_name: [:0]const u8 = "Sample Window Class";
 
-    const wc = user32.WNDCLASSEXA{
+    const wc = user32.WNDCLASSEXW{
         .lpfnWndProc = windowCallback,
         .hInstance = hinstance,
-        .lpszClassName = class_name,
+        .lpszClassName = std.unicode.utf8ToUtf16LeStringLiteral(class_name),
         .hIcon = null,
         .hCursor = null,
         .hbrBackground = null,
@@ -693,13 +819,13 @@ pub fn wWinMain(hinstance: win.HINSTANCE, prev_instance: ?win.HINSTANCE, cmd_lin
         .style = 0,
     };
 
-    const class_atom: win.ATOM = user32.RegisterClassExA(&wc);
+    const class_atom: win.ATOM = user32.RegisterClassExW(&wc);
     _ = class_atom;
 
-    window_handle = user32.createWindowExA(
+    window_handle = user32.createWindowExW(
         0,
-        class_name,
-        "Vulkan App",
+        std.unicode.utf8ToUtf16LeStringLiteral(class_name),
+        std.unicode.utf8ToUtf16LeStringLiteral("Vulkan App"),
         user32.WS_OVERLAPPEDWINDOW,
         user32.CW_USEDEFAULT,
         user32.CW_USEDEFAULT,
@@ -720,8 +846,7 @@ pub fn wWinMain(hinstance: win.HINSTANCE, prev_instance: ?win.HINSTANCE, cmd_lin
     defer _ = gpa.deinit();
 
     var allocator = gpa.allocator();
-
-    var graphics_context: GraphicsContext = undefined;
+    default_allocator = allocator;
 
     setup(allocator, &graphics_context) catch |err| {
         std.log.err("Setup failed. Error: {}", .{err});
@@ -768,86 +893,38 @@ fn appLoop(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
     while (!is_shutdown_requested) {
         frame_count += 1;
 
+        // std.log.info("Reading message", .{});
         var message: user32.MSG = undefined;
-        user32.getMessageA(&message, null, 0, 0) catch |err| {
-            if (err == error.Quit) {
-                return;
+        if(try user32.peekMessageW(&message, null, 0, 0, user32.PM_REMOVE))
+        {
+            if(message.message == user32.WM_QUIT)
+            {
+                is_shutdown_requested = true;
+            } 
+            else 
+            {
+                // std.log.info("Translating message", .{});
+                _ = user32.translateMessage(&message);
+                // std.log.info("Dispatching message..", .{});
+                _ = user32.dispatchMessageW(&message);
             }
-            std.log.err("Failed to get message. Error: {}", .{err});
-            return error.GetMessageFailed;
-        };
-        _ = user32.translateMessage(&message);
-        _ = user32.dispatchMessageA(&message);
+        }
+
+        // user32.getMessageA(&message, null, 0, 0) catch |err| {
+        //     if (err == error.Quit) {
+        //         return;
+        //     }
+        //     std.log.err("Failed to get message. Error: {}", .{err});
+        //     return error.GetMessageFailed;
+        // };
+        // _ = user32.translateMessage(&message);
+        // _ = user32.dispatchMessageA(&message);
+
+        std.log.info("App loop..", .{});
 
         const frame_start_ns = std.time.nanoTimestamp();
 
-        if (framebuffer_resized) {
-            app.swapchain_extent.width = screen_dimensions.width;
-            app.swapchain_extent.height = screen_dimensions.height;
-            is_draw_required = true;
-            framebuffer_resized = false;
-            try recreateSwapchain(allocator, app);
-        }
-
-        if(is_draw_required) {
-            is_draw_required = false;
-            try draw();
-            is_render_requested = true;
-            is_record_requested = true;
-        }
-
-        if(is_render_requested) {
-            is_render_requested = false;
-
-            //
-            // Update our background
-            //
-
-            const current_time = std.time.milliTimestamp();
-            std.debug.assert(current_time >= background_color_loop_time_base);
-
-            const loop_ms: f64 = @floatFromInt(background_color_loop_ms);
-            var color_transition: f32 = @floatCast(@rem(@as(f64, @floatFromInt(current_time - background_color_loop_time_base)), loop_ms) / loop_ms);
-            if(color_transition > 0.5) {
-                color_transition = 1.0 - color_transition;
-            }
-
-            std.debug.assert(color_transition >= 0.0);
-            std.debug.assert(color_transition <= 1.0);
-
-            background_quad[0].color = graphics.RGBA(f32){
-                .r = lerp(background_color_a[0].r, background_color_b[0].r, color_transition),
-                .g = lerp(background_color_a[0].g, background_color_b[0].g, color_transition),
-                .b = lerp(background_color_a[0].b, background_color_b[0].b, color_transition),
-                .a = 1.0
-            };
-            background_quad[1].color = graphics.RGBA(f32){
-                .r = lerp(background_color_a[1].r, background_color_b[1].r, color_transition),
-                .g = lerp(background_color_a[1].g, background_color_b[1].g, color_transition),
-                .b = lerp(background_color_a[1].b, background_color_b[1].b, color_transition),
-                .a = 1.0
-            };
-            background_quad[2].color = graphics.RGBA(f32){
-                .r = lerp(background_color_a[2].r, background_color_b[2].r, color_transition),
-                .g = lerp(background_color_a[2].g, background_color_b[2].g, color_transition),
-                .b = lerp(background_color_a[2].b, background_color_b[2].b, color_transition),
-                .a = 1.0
-            };
-            background_quad[3].color = graphics.RGBA(f32){
-                .r = lerp(background_color_a[3].r, background_color_b[3].r, color_transition),
-                .g = lerp(background_color_a[3].g, background_color_b[3].g, color_transition),
-                .b = lerp(background_color_a[3].b, background_color_b[3].b, color_transition),
-                .a = 1.0
-            };
-
-            // Even though we're running at a constant loop, we don't always need to re-record command buffers
-            if(is_record_requested) {
-                is_record_requested = false;
-                try recordRenderPass(app.*, vertex_buffer_quad_count * 6);
-            }
-
-            try renderFrame(allocator, app);
-        }
+        try processFrame(allocator, app);
 
         const frame_end_ns = std.time.nanoTimestamp();
         std.debug.assert(frame_end_ns >= frame_start_ns);
@@ -884,6 +961,77 @@ fn appLoop(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
     std.log.info("Average: {}", .{std.fmt.fmtDuration((frame_duration_awake_ns / frame_count))});
 
     try app.device_dispatch.deviceWaitIdle(app.logical_device);
+}
+
+fn processFrame(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
+    if (framebuffer_resized) {
+        app.swapchain_extent.width = screen_dimensions.width;
+        app.swapchain_extent.height = screen_dimensions.height;
+        is_draw_required = true;
+        framebuffer_resized = false;
+        std.log.info("Recreating swapchain!", .{});
+        try recreateSwapchain(allocator, app);
+    }
+
+    if(is_draw_required) {
+        is_draw_required = false;
+        try draw();
+        is_render_requested = true;
+        is_record_requested = true;
+    }
+
+    if(is_render_requested) {
+        is_render_requested = false;
+
+        //
+        // Update our background
+        //
+
+        const current_time = std.time.milliTimestamp();
+        std.debug.assert(current_time >= background_color_loop_time_base);
+
+        const loop_ms: f64 = @floatFromInt(background_color_loop_ms);
+        var color_transition: f32 = @floatCast(@rem(@as(f64, @floatFromInt(current_time - background_color_loop_time_base)), loop_ms) / loop_ms);
+        if(color_transition > 0.5) {
+            color_transition = 1.0 - color_transition;
+        }
+
+        std.debug.assert(color_transition >= 0.0);
+        std.debug.assert(color_transition <= 1.0);
+
+        background_quad[0].color = graphics.RGBA(f32){
+            .r = lerp(background_color_a[0].r, background_color_b[0].r, color_transition),
+            .g = lerp(background_color_a[0].g, background_color_b[0].g, color_transition),
+            .b = lerp(background_color_a[0].b, background_color_b[0].b, color_transition),
+            .a = 1.0
+        };
+        background_quad[1].color = graphics.RGBA(f32){
+            .r = lerp(background_color_a[1].r, background_color_b[1].r, color_transition),
+            .g = lerp(background_color_a[1].g, background_color_b[1].g, color_transition),
+            .b = lerp(background_color_a[1].b, background_color_b[1].b, color_transition),
+            .a = 1.0
+        };
+        background_quad[2].color = graphics.RGBA(f32){
+            .r = lerp(background_color_a[2].r, background_color_b[2].r, color_transition),
+            .g = lerp(background_color_a[2].g, background_color_b[2].g, color_transition),
+            .b = lerp(background_color_a[2].b, background_color_b[2].b, color_transition),
+            .a = 1.0
+        };
+        background_quad[3].color = graphics.RGBA(f32){
+            .r = lerp(background_color_a[3].r, background_color_b[3].r, color_transition),
+            .g = lerp(background_color_a[3].g, background_color_b[3].g, color_transition),
+            .b = lerp(background_color_a[3].b, background_color_b[3].b, color_transition),
+            .a = 1.0
+        };
+
+        // Even though we're running at a constant loop, we don't always need to re-record command buffers
+        if(is_record_requested) {
+            is_record_requested = false;
+            try recordRenderPass(app.*, vertex_buffer_quad_count * 6);
+        }
+
+        try renderFrame(allocator, app);
+    }
 }
 
 /// Our example draw function

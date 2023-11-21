@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2022 Keith Chambers
+// Copyright (c) 2023 Keith Chambers
 
 const std = @import("std");
+const assert = std.debug.assert;
 const builtin = @import("builtin");
 const vk = @import("vulkan-zig");
 const vulkan_config = @import("vulkan_config.zig");
@@ -10,34 +11,202 @@ const shaders = @import("shaders");
 const win = std.os.windows;
 const user32 = win.user32;
 
+const MapChunk = struct {
+    obstacle_count: u32,
+    obstacle_index: u32,
+};
+
+const Player = struct {
+    const State = enum(u32) {
+        running,
+        jumping,
+    };
+    /// X position in current chunk
+    position_x: f32,
+    position_y: f32,
+};
+
+const Obstacles = struct {
+    const Obstacle = struct {
+        x: f32,
+        width: f32,
+        height: f32,
+    };
+
+    const buffer_size = 12;
+    const variance: f32 = 300.0;
+
+    buffer: [buffer_size]Obstacle,
+
+    pub fn init(self: *@This()) void {
+        var current_x: f32 = 340;
+
+        const obstacle_interval: f32 = 220;
+
+        for (&self.buffer) |*obstacle| {
+            obstacle.* = .{ .x = current_x, .height = 40, .width = 20 };
+            current_x += (obstacle_interval + (random.float(f32) * variance));
+        }
+    }
+
+    pub fn frameWidth(self: @This()) f32 {
+        return (self.buffer[buffer_size - 1].x + self.buffer[buffer_size - 1].width) - self.buffer[0].x;
+    }
+
+    pub fn frameStart(self: @This()) f32 {
+        return self.buffer[0].x;
+    }
+
+    pub fn visibleObstacles(self: *@This(), x_offset: f32, width: f32) []const Obstacle {
+        const start_index: usize = blk: {
+            for (self.buffer, 0..) |obstacle, obstacle_i| {
+                if ((obstacle.x + obstacle.width) > x_offset) {
+                    break :blk obstacle_i;
+                }
+            }
+            unreachable;
+        };
+        const end_index: usize = blk: {
+            const x_max: f32 = x_offset + width;
+            for (self.buffer[start_index..], 0..) |obstacle, obstacle_i| {
+                if (obstacle.x > x_max) {
+                    break :blk obstacle_i + start_index;
+                }
+            }
+            break :blk buffer_size - 1;
+        };
+
+        assert(start_index < end_index);
+        const visible_ostacles = self.buffer[start_index..end_index];
+
+        return visible_ostacles;
+    }
+
+    pub fn extentGeometry(self: *@This(), min_x_threshold: f32) void {
+        const keep_index: usize = blk: {
+            for (self.buffer, 0..) |obstacle, obstacle_i| {
+                if ((obstacle.x + obstacle.width) >= min_x_threshold) {
+                    break :blk obstacle_i;
+                }
+            }
+            unreachable;
+        };
+
+        const obstacle_interval: f32 = 220;
+        var current_x: f32 = self.buffer[buffer_size - 1].x + obstacle_interval;
+
+        const keep_count: usize = buffer_size - keep_index;
+        for (0..keep_count, keep_index..buffer_size) |dst_i, src_i| {
+            self.buffer[dst_i] = self.buffer[src_i];
+        }
+
+        for (self.buffer[keep_count..]) |*obstacle| {
+            obstacle.* = .{ .x = current_x, .height = 40, .width = 20 };
+            current_x += (obstacle_interval + (random.float(f32) * variance));
+        }
+    }
+};
+
+var obstacle_buffer: Obstacles = undefined;
+
+const pixels_per_s: f32 = 100;
+/// The current x offset of the game in pixels
+var screen_offset_px: f32 = 0.0;
+
+/// The x offset of the game when the current frame was rendered
+var frame_offset_px: f32 = 0;
+
+/// The distance from the beginning of the frame to the end of the last obstacle
+var frame_width_px: f32 = 0;
+
+const ground_height_px: f32 = 40;
+
+fn normalizePoint(absolute_px: f32, max_value: f32) f32 {
+    assert(absolute_px <= max_value);
+    return -1.0 + ((absolute_px / max_value) * 2.0);
+}
+
+fn normalizeDist(absolute_px: f32, max_value: f32) f32 {
+    assert(absolute_px <= max_value);
+    return (absolute_px / max_value) * 2.0;
+}
+
+fn needExtentGeometry() bool {
+    const screen_width: f32 = @floatFromInt(screen_dimensions.width);
+    const visible_x_offset: f32 = screen_offset_px + screen_width;
+    const frame_visible_until: f32 = frame_offset_px + frame_width_px;
+    const needs_extending: bool = visible_x_offset >= frame_visible_until;
+    return needs_extending;
+}
+
+//
+// Ideally you want to be able to specify the range in which to render, so you don't need to keep
+// rendering each frame. You can render off the screen and then use a push constant to redraw
+// the screen
+//
+var cached_quads_to_render_count: usize = 0;
+
+fn renderGame(time_delta: f32) !usize {
+    var face_writer = quad_face_writer_pool.create(0, 50);
+    const obs_color = graphics.RGBA(f32){ .r = 0.7, .g = 0.4, .b = 0.3, .a = 1.0 };
+
+    screen_offset_px = time_delta * pixels_per_s;
+
+    if (needExtentGeometry()) {
+        std.log.warn("Geometry needs to be extended", .{});
+        obstacle_buffer.extentGeometry(screen_offset_px);
+
+        frame_width_px = obstacle_buffer.frameWidth();
+        frame_offset_px = obstacle_buffer.frameStart();
+
+        assert(!needExtentGeometry());
+    }
+
+    const screen_width: f32 = @floatFromInt(screen_dimensions.width);
+    const screen_height: f32 = @floatFromInt(screen_dimensions.height);
+
+    const ground_color = graphics.RGBA(f32).fromInt(u8, 10, 200, 30, 255);
+    const ground_extent = geometry.Extent2D(f32){
+        .x = -1.0,
+        .y = 1.0,
+        .width = 2.0,
+        .height = normalizeDist(ground_height_px, screen_height),
+    };
+    (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, ground_extent, ground_color, .bottom_left);
+
+    vertex_buffer_quad_count += 1;
+
+    const obstacle_baseline_px: f32 = ground_height_px;
+    const obstacles = obstacle_buffer.visibleObstacles(screen_offset_px, screen_width);
+
+    for (obstacles) |obstacle| {
+        const obs_extent = geometry.Extent2D(f32){
+            .x = normalizePoint(obstacle.x - screen_offset_px, screen_width),
+            .y = normalizePoint(screen_height - obstacle_baseline_px, screen_height),
+            .width = normalizeDist(obstacle.width, screen_width),
+            .height = normalizeDist(obstacle.height, screen_height),
+        };
+        (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, obs_extent, obs_color, .bottom_left);
+    }
+
+    cached_quads_to_render_count = obstacles.len + 1;
+    return cached_quads_to_render_count;
+}
+
+//
+// This is a pretty bad hack, I should just load windows headers
+//
+
+extern fn LoadCursorW(hwnd: ?win.HINSTANCE, lpCursorName: [*:0]const u16) callconv(.C) win.HCURSOR;
+extern fn SetCursor(cursor: ?win.HCURSOR) callconv(.C) win.HCURSOR;
+
+const IDC_ARROW: [*:0]const u16 = makeIntreSourceW(32512);
+
+fn makeIntreSourceW(comptime value: u64) [*:0]const u16 {
+    return @as([*:0]const u16, @ptrFromInt(value));
+}
+
 const dynlib = std.DynLib;
-
-// TODO:
-// - Audit memory allocation overall
-// - Audit logging
-// - vulkan: Destroy all vulkan objects
-// - vulkan: Audit staging_buffer code
-// - vulkan: Use a separate memory type for texture data
-
-// ====== Contents ======
-//
-//  1. Options
-//  2. Globals
-//  3. Core Types + Functions
-//  4. Wayland Types + Functions
-//  5. Vulkan Code
-//  6. Vulkan Util / Wrapper Functions
-//  7. Print Functions
-//  8. Util + Misc
-//
-// ======================
-
-//
-//   1. Options
-//
-
-/// Change this to force the log level. Otherwise it is determined by release mode
-pub const log_level: std.log.Level = .info;
 
 /// Screen dimensions of the application, as reported by wayland
 /// Initial values are arbirary and will be updated once the wayland
@@ -72,52 +241,9 @@ const transparancy_enabled = false;
 /// Color to use for icon images
 const icon_color = graphics.RGB(f32).fromInt(11, 11, 11);
 
-/// The transparency of the selected surface
-/// Valid values between 0.0 (no transparency) and 1.0 (full)
-/// Ignored if `transparancy_enabled` is false
-const transparancy_level = 0.0;
-
-/// Initial background color of application surface before transparency is applied
-/// Each color refers to a corner of the quad.
-var background_color_a = [4]graphics.RGB(f32){
-    graphics.RGB(f32).fromInt(66, 77, 26), // Top Left
-    graphics.RGB(f32).fromInt(65, 88, 200), // Top Right
-    graphics.RGB(f32).fromInt(111, 89, 156), // Bottom Right
-    graphics.RGB(f32).fromInt(28, 52, 55), // Bottom Left
-};
-
-/// Background color to transition to
-var background_color_b = [4]graphics.RGB(f32){
-    graphics.RGB(f32).fromInt(255, 74, 255),
-    graphics.RGB(f32).fromInt(65, 74, 255),
-    graphics.RGB(f32).fromInt(73, 74, 111),
-    graphics.RGB(f32).fromInt(133, 74, 255),
-};
-
-const window_decorations = struct {
-    const height_pixels = 40;
-    const color = graphics.RGBA(f32).fromInt(u8, 200, 200, 200, 255);
-    const exit_button = struct {
-        const size_pixels = 24;
-        const color_hovered = graphics.RGBA(f32).fromInt(u8, 180, 180, 180, 255);
-    };
-};
-
-/// The time in milliseconds for the background color to change
-/// from color a to b, then back to a
-const background_color_loop_ms: u32 = 1000 * 10;
-
 /// Version of Vulkan to use
 /// https://www.khronos.org/registry/vulkan/
 const vulkan_api_version = vk.API_VERSION_1_2;
-
-/// How many times the main loop should check for updates per second
-/// NOTE: This does not refer to how many times the screen is drawn to. That is driven by the
-///       `frameListener` callback that the wayland compositor will trigger when it's ready for
-///       another image. In present mode FIFO this should correspond to the monitors display rate
-///       using v-sync.
-///       However, `input_fps` can be used to limit / reduce the display refresh rate
-const input_fps: u32 = 30;
 
 /// Options to print various vulkan objects that will be selected at
 /// runtime based on the hardware / system that is available
@@ -128,6 +254,18 @@ const print_vulkan_objects = struct {
     /// VSync, transparency, etc
     const surface_abilties: bool = true;
 };
+
+var player_position = geometry.Coordinates2D(f32){
+    .x = 20.0,
+    .y = 20.0,
+};
+
+var controls: packed struct {
+    up: bool = false,
+    left: bool = false,
+    right: bool = false,
+    down: bool = false,
+} = .{};
 
 //
 // Bonus: Options you shouldn't change
@@ -245,11 +383,6 @@ const vertices_range_size = max_texture_quads_per_render * @sizeOf(graphics.Gene
 const vertices_range_count = vertices_range_size / @sizeOf(graphics.GenericVertex);
 const memory_size = indices_range_size + vertices_range_size;
 
-/// Vertices to be reserved at the beginning of our buffer and
-/// not overriden in our draw function
-/// Here we're just reserving the background quad
-const vertices_reserved_range_count = 1;
-
 var quad_face_writer_pool: QuadFaceWriterPool(graphics.GenericVertex) = undefined;
 
 const validation_layers = if (enable_validation_layers)
@@ -271,7 +404,7 @@ var is_shutdown_requested: bool = false;
 ///   4. Number of vertices to be drawn has changed
 var is_record_requested: bool = true;
 
-var vertex_buffer: []graphics.QuadFace(graphics.GenericVertex) = undefined;
+// var vertex_buffer: []graphics.QuadFace(graphics.GenericVertex) = undefined;
 
 var current_frame: u32 = 0;
 var previous_frame: u32 = 0;
@@ -292,13 +425,6 @@ var texture_vertices_buffer: vk.Buffer = undefined;
 var texture_indices_buffer: vk.Buffer = undefined;
 
 var texture_memory_map: [*]graphics.RGBA(f32) = undefined;
-
-var background_color_loop_time_base: i64 = undefined;
-
-/// Pointer to quad that will be reused to control the background color of the application
-/// An alternative method, would be to use the clear_colors parameter when recording a render pass
-/// However, this allows us to avoid re-recording commands buffers, etc
-var background_quad: *graphics.QuadFace(graphics.GenericVertex) = undefined;
 
 const texture_size_bytes = texture_layer_dimensions.width * texture_layer_dimensions.height * @sizeOf(graphics.RGBA(f32));
 
@@ -653,12 +779,18 @@ fn timerCallback(hWnd: win.HWND, message: win.UINT, idTimer: win.UINT_PTR, dwTim
     _ = message;
     _ = idTimer;
     _ = dwTime;
-    if(framebuffer_resized) {
-        processFrame(default_allocator, &graphics_context) catch |err| {
+
+    const current_ts: i128 = std.time.nanoTimestamp();
+    const delta_ts = current_ts - game_current_ts;
+    const delta_s: f32 = @floatFromInt(@divTrunc(delta_ts, std.time.ns_per_s));
+    game_current_ts = current_ts;
+
+    // if(framebuffer_resized) {
+        processFrame(default_allocator, &graphics_context, delta_s) catch |err| {
             std.log.warn("Failed to process frame. Error: {}", .{err});
             return;
         };
-    }
+    // }
 }
 
 fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam: win.LPARAM) callconv(.C) win.LRESULT {
@@ -678,9 +810,39 @@ fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam
         // user32.WM_SYSCOMMAND => std.log.info("WM_SYSCOMMAND", .{}),
         user32.WM_CLOSE => std.log.info("WM_CLOSE", .{}),
         user32.WM_INPUTLANGCHANGE => std.log.info("WM_INPUTLANGCHANGE", .{}),
-        user32.WM_CHAR, user32.WM_SYSCHAR => std.log.info("WM_CHAR, WM_SYSCHAR", .{}),
+        user32.WM_CHAR => {
+
+            std.log.info("WM_CHAR", .{});
+            var utf8_buffer: [4]u8 = undefined;
+            const len: u32 = std.unicode.utf8Encode(@intCast(wparam), &utf8_buffer) catch unreachable;
+            std.debug.assert(len == 1);
+            std.log.info("Char: {c}", .{utf8_buffer[0]});
+            
+        },
+        user32.WM_SYSCHAR => std.log.info("WM_CHAR, WM_SYSCHAR", .{}),
         user32.WM_UNICHAR => std.log.info("WM_UNICHAR", .{}),
-        user32.WM_KEYDOWN, user32.WM_SYSKEYDOWN, user32.WM_KEYUP, user32.WM_SYSKEYUP => std.log.info("user32.WM_KEYDOWN, user32.WM_SYSKEYDOWN, user32.WM_KEYUP, user32.WM_SYSKEYUP", .{}),
+        user32.WM_KEYDOWN => {
+            std.log.info("Keydown!!. wparam: {d}", .{wparam});
+
+            switch(wparam) {
+                0x57 => controls.up = true,
+                0x53 => controls.down = true,
+                0x41 => controls.left = true,
+                0x44 => controls.right = true,
+                else => {}
+            }
+
+        },
+        user32.WM_KEYUP => {
+            switch(wparam) {
+                0x57 => controls.up = false,
+                0x53 => controls.down = false,
+                0x41 => controls.left = false,
+                0x44 => controls.right = false,
+                else => {}
+            }
+        },
+        user32.WM_SYSKEYDOWN, user32.WM_SYSKEYUP => std.log.info("user32.WM_SYSKEYDOWN, user32.WM_SYSKEYUP", .{}),
         user32.WM_INPUT => std.log.info("WM_INPUT", .{}),
         user32.WM_MOUSELEAVE => std.log.info("WM_MOUSELEAVE", .{}),
         user32.WM_MOUSEWHEEL => std.log.info("WM_MOUSEWHEEL", .{}),
@@ -690,7 +852,7 @@ fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam
             //
             // Drop back to about 30fps
             //
-            const time_interval_ms: win.UINT = 33;
+            const time_interval_ms: win.UINT = 6;
             wm_timer_id = user32.setTimer(null, 0, time_interval_ms, &timerCallback) catch |err| {
                 std.log.err("Failed to set timer. Err: {}", .{err});
                 return 0;
@@ -726,6 +888,7 @@ fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam
         // user32.WM_PAINT => std.log.info("WM_PAINT", .{}),
         user32.WM_ERASEBKGND => {
             std.log.info("WM_ERASEBKGND", .{});
+            // processFrame(default_allocator, &graphics_context) catch return 1;
             return 1;
         },
         // user32.WM_NCACTIVATE => std.log.info("WM_NCACTIVATE", .{}),
@@ -734,10 +897,16 @@ fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam
         // user32.WM_DWMCOLORIZATIONCOLORCHANGED => std.log.info("WM_DWMCOLORIZATIONCOLORCHANGED", .{}),
         // user32.WM_GETDPISCALEDSIZE => std.log.info("WM_GETDPISCALEDSIZE", .{}),
         // user32.WM_DPICHANGED => std.log.info("WM_DPICHANGED", .{}),
-        // user32.WM_SETCURSOR => {
-        //     std.log.info("WM_SETCURSOR", .{});
-        //     return 1;
-        // },
+        user32.WM_SETCURSOR => {
+            const HTCLIENT: u64 = 1;
+            if(lparam & @as(u64, 0xffff) == HTCLIENT) {
+                // std.log.info("WM_SETCURSOR", .{});
+                _ = SetCursor(default_cursor);
+            } else {
+                // std.log.info("Cursor outside of client area", .{});
+            }
+            // return win.TRUE;
+        },
         user32.WM_DROPFILES => std.log.info("WM_DROPFILES", .{}),
         user32.WM_DESTROY => {
             user32.postQuitMessage(0);
@@ -786,7 +955,7 @@ fn windowCallback(hwnd: win.HWND, umessage: win.UINT, wparam: win.WPARAM, lparam
             return 0;
         },
         else => {
-            std.log.info("Unknown event..", .{});
+            // std.log.info("Unknown event..", .{});
             // return user32.defWindowProcW(hwnd, umessage, wparam, lparam);
         }
     }
@@ -798,12 +967,18 @@ var app_hinstance: win.HINSTANCE = undefined;
 var window_handle: win.HWND = undefined;
 var default_allocator: std.mem.Allocator = undefined;
 var graphics_context: GraphicsContext = undefined;
+var default_cursor: win.HCURSOR = undefined;
+var prng: std.rand.Xoshiro256 = undefined;
+var random: std.rand.Random = undefined;
 
 pub fn wWinMain(hinstance: win.HINSTANCE, prev_instance: ?win.HINSTANCE, cmd_line: win.PWSTR, cmd_show_count: win.INT) win.INT {
     _ = cmd_line;
     _ = prev_instance;
 
     app_hinstance = hinstance;
+
+    prng = std.rand.DefaultPrng.init(0);
+    random = prng.random();
 
     const class_name: [:0]const u8 = "Sample Window Class";
 
@@ -852,6 +1027,9 @@ pub fn wWinMain(hinstance: win.HINSTANCE, prev_instance: ?win.HINSTANCE, cmd_lin
         std.log.err("Setup failed. Error: {}", .{err});
         return 1;
     };
+
+    default_cursor = LoadCursorW(null, IDC_ARROW);
+
     appLoop(allocator, &graphics_context) catch |err| {
         std.log.err("Loop failed. Error: {}", .{err});
         return 1;
@@ -883,17 +1061,22 @@ fn cleanup(allocator: std.mem.Allocator, app: *GraphicsContext) void {
 
 fn appLoop(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
 
-    const target_ms_per_frame: u32 = 1000 / input_fps;
-    const target_ns_per_frame = target_ms_per_frame * std.time.ns_per_ms;
+    game_start_ts = std.time.nanoTimestamp();
+    game_current_ts = game_start_ts;
 
-    std.log.info("Target milliseconds / frame: {d}", .{target_ms_per_frame});
-
-    background_color_loop_time_base = std.time.milliTimestamp();
+    obstacle_buffer.init();
+    frame_width_px = obstacle_buffer.frameWidth();
 
     while (!is_shutdown_requested) {
         frame_count += 1;
 
-        // std.log.info("Reading message", .{});
+        const delta_ts: f32 = @floatFromInt(game_current_ts - game_start_ts);
+        assert(delta_ts >= 0);
+
+        const delta_s: f32 = delta_ts / std.time.ns_per_s;
+
+        // std.log.info("Time delta seconds: {d}", .{delta_s});
+
         var message: user32.MSG = undefined;
         if(try user32.peekMessageW(&message, null, 0, 0, user32.PM_REMOVE))
         {
@@ -903,28 +1086,33 @@ fn appLoop(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
             } 
             else 
             {
-                // std.log.info("Translating message", .{});
                 _ = user32.translateMessage(&message);
-                // std.log.info("Dispatching message..", .{});
                 _ = user32.dispatchMessageW(&message);
             }
         }
 
-        // user32.getMessageA(&message, null, 0, 0) catch |err| {
-        //     if (err == error.Quit) {
-        //         return;
-        //     }
-        //     std.log.err("Failed to get message. Error: {}", .{err});
-        //     return error.GetMessageFailed;
-        // };
-        // _ = user32.translateMessage(&message);
-        // _ = user32.dispatchMessageA(&message);
-
-        std.log.info("App loop..", .{});
+        const velocity_pixels: f32 = 5.0;
+        if(controls.up) {
+            player_position.y -= velocity_pixels;
+        }
+        if(controls.down) {
+            player_position.y += velocity_pixels;
+            const screen_height: f32 = @floatFromInt(screen_dimensions.height);
+            if((player_position.y + 50) > (screen_height - ground_height_px)) {
+                player_position.y = (screen_height - ground_height_px) - 50;
+            }
+            std.log.info("Player Y: {d} screen height {d} ground {d}", .{player_position.y, screen_height, ground_height_px});
+        }
+        if(controls.left) {
+            player_position.x -= velocity_pixels;
+        }
+        if(controls.right) {
+            player_position.x += velocity_pixels;
+        }
 
         const frame_start_ns = std.time.nanoTimestamp();
 
-        try processFrame(allocator, app);
+        try processFrame(allocator, app, delta_s);
 
         const frame_end_ns = std.time.nanoTimestamp();
         std.debug.assert(frame_end_ns >= frame_start_ns);
@@ -939,19 +1127,10 @@ fn appLoop(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
             fastest_frame_ns = frame_duration_ns;
         }
 
-        if(frame_duration_ns < target_ns_per_frame) {
-            // std.debug.assert(target_ns_per_frame >= frame_duration_ns);
-            const remaining_ns: u64 = target_ns_per_frame - @as(u64, @intCast(frame_duration_ns));
-            std.debug.assert(remaining_ns <= target_ns_per_frame);
-
-            const frame_work_completed_ns = std.time.nanoTimestamp();
-            frame_duration_awake_ns += @as(u64, @intCast(frame_work_completed_ns - frame_start_ns));
-
-            std.time.sleep(remaining_ns);
-        }
-
         const frame_completion_ns = std.time.nanoTimestamp();
         frame_duration_total_ns += @as(u64, @intCast(frame_completion_ns - frame_start_ns));
+
+        game_current_ts = std.time.nanoTimestamp();
     }
 
     std.log.info("Run time: {d}", .{std.fmt.fmtDuration(frame_duration_total_ns)});
@@ -963,66 +1142,31 @@ fn appLoop(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
     try app.device_dispatch.deviceWaitIdle(app.logical_device);
 }
 
-fn processFrame(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
-    if (framebuffer_resized) {
-        app.swapchain_extent.width = screen_dimensions.width;
-        app.swapchain_extent.height = screen_dimensions.height;
-        is_draw_required = true;
-        framebuffer_resized = false;
-        std.log.info("Recreating swapchain!", .{});
-        try recreateSwapchain(allocator, app);
-    }
+var once: bool = true;
 
-    if(is_draw_required) {
+fn processFrame(allocator: std.mem.Allocator, app: *GraphicsContext, time_delta_s: f32) !void {
+
+    is_render_requested = true;
+
+    // if (once) {
+    //     once = false;
+    //     app.swapchain_extent.width = screen_dimensions.width;
+    //     app.swapchain_extent.height = screen_dimensions.height;
+    //     is_draw_required = true;
+    //     framebuffer_resized = false;
+    //     std.log.info("Recreating swapchain!", .{});
+    //     try recreateSwapchain(allocator, app);
+    // }
+
+    // if(is_draw_required) {
         is_draw_required = false;
-        try draw();
+        try draw(time_delta_s);
         is_render_requested = true;
         is_record_requested = true;
-    }
+    // }
 
     if(is_render_requested) {
         is_render_requested = false;
-
-        //
-        // Update our background
-        //
-
-        const current_time = std.time.milliTimestamp();
-        std.debug.assert(current_time >= background_color_loop_time_base);
-
-        const loop_ms: f64 = @floatFromInt(background_color_loop_ms);
-        var color_transition: f32 = @floatCast(@rem(@as(f64, @floatFromInt(current_time - background_color_loop_time_base)), loop_ms) / loop_ms);
-        if(color_transition > 0.5) {
-            color_transition = 1.0 - color_transition;
-        }
-
-        std.debug.assert(color_transition >= 0.0);
-        std.debug.assert(color_transition <= 1.0);
-
-        background_quad[0].color = graphics.RGBA(f32){
-            .r = lerp(background_color_a[0].r, background_color_b[0].r, color_transition),
-            .g = lerp(background_color_a[0].g, background_color_b[0].g, color_transition),
-            .b = lerp(background_color_a[0].b, background_color_b[0].b, color_transition),
-            .a = 1.0
-        };
-        background_quad[1].color = graphics.RGBA(f32){
-            .r = lerp(background_color_a[1].r, background_color_b[1].r, color_transition),
-            .g = lerp(background_color_a[1].g, background_color_b[1].g, color_transition),
-            .b = lerp(background_color_a[1].b, background_color_b[1].b, color_transition),
-            .a = 1.0
-        };
-        background_quad[2].color = graphics.RGBA(f32){
-            .r = lerp(background_color_a[2].r, background_color_b[2].r, color_transition),
-            .g = lerp(background_color_a[2].g, background_color_b[2].g, color_transition),
-            .b = lerp(background_color_a[2].b, background_color_b[2].b, color_transition),
-            .a = 1.0
-        };
-        background_quad[3].color = graphics.RGBA(f32){
-            .r = lerp(background_color_a[3].r, background_color_b[3].r, color_transition),
-            .g = lerp(background_color_a[3].g, background_color_b[3].g, color_transition),
-            .b = lerp(background_color_a[3].b, background_color_b[3].b, color_transition),
-            .a = 1.0
-        };
 
         // Even though we're running at a constant loop, we don't always need to re-record command buffers
         if(is_record_requested) {
@@ -1034,83 +1178,27 @@ fn processFrame(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
     }
 }
 
+var game_start_ts: i128 = 0;
+var game_current_ts: i128 = 0;
+
 /// Our example draw function
 /// This will run anytime the screen is resized
-fn draw() !void {
-    const outer_margin_pixels: u32 = 20;
-    const inner_margin_pixels: u32 = 10;
-    
-    const dimensions_pixels = geometry.Dimensions2D(u32) {
-        .width = icon_dimensions.width,
-        .height = icon_dimensions.height,
+fn draw(time_delta_s: f32) !void {
+    vertex_buffer_quad_count = @intCast(try renderGame(time_delta_s));
+    const player_extent = geometry.Extent2D(f32) {
+        .x = -1.0 + (player_position.x / @as(f32, @floatFromInt(screen_dimensions.width))) * 2.0,
+        .y = -1.0 + (player_position.y / @as(f32, @floatFromInt(screen_dimensions.height)) * 2.0),
+        .width = (50.0 / @as(f32, @floatFromInt(screen_dimensions.width)) * 2.0),
+        .height = (50.0 / @as(f32, @floatFromInt(screen_dimensions.height)) * 2.0),
     };
 
-    const available_screen_dimensions = screen_dimensions;
+    var face_writer = quad_face_writer_pool.create(@intCast(vertex_buffer_quad_count), 1);
 
-    const insufficient_horizontal_space = (available_screen_dimensions.width < (dimensions_pixels.width + outer_margin_pixels * 2));
-    const insufficient_vertical_space = (available_screen_dimensions.height < (dimensions_pixels.height + outer_margin_pixels * 2));
+    const player_color = graphics.RGBA(f32){ .r = 0.1, .g = 0.8, .b = 0.1, .a = 1.0 };
 
-    if(insufficient_horizontal_space or insufficient_vertical_space) {
-        vertex_buffer_quad_count = 0;
-        return;
-    }
+    (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, player_extent, player_color, .top_left);
 
-    var horizonal_quad_space_pixels = (available_screen_dimensions.width - (outer_margin_pixels * 2)) - dimensions_pixels.width;
-    var horizonal_count: u32 = 1;
-
-    {
-        const required_space = dimensions_pixels.width + inner_margin_pixels;
-        while(horizonal_quad_space_pixels >= required_space) {
-            horizonal_count += 1;
-            horizonal_quad_space_pixels -= required_space;
-        }
-    }
-
-    var vertical_quad_space_pixels: u32 = (available_screen_dimensions.height - (outer_margin_pixels * 2)) - dimensions_pixels.height;
-    var vertical_count: u32 = 1;
-
-    {
-        const required_space = dimensions_pixels.height + inner_margin_pixels;
-        while(vertical_quad_space_pixels >= required_space) {
-            vertical_count += 1;
-            vertical_quad_space_pixels -= required_space;
-        }
-    }
-
-    const x_begin_pixels = outer_margin_pixels + (horizonal_quad_space_pixels / 2);
-    const y_begin_pixels = outer_margin_pixels + (vertical_quad_space_pixels / 2);
-
-    const x_begin = -1.0 + (@as(f32, @floatFromInt(x_begin_pixels * 2)) / @as(f32, @floatFromInt(screen_dimensions.width)));
-    const y_begin = -1.0 + (@as(f32, @floatFromInt(y_begin_pixels * 2)) / @as(f32, @floatFromInt(screen_dimensions.height)));
-
-    const stride_horizonal = @as(f32, @floatFromInt((dimensions_pixels.width + inner_margin_pixels) * 2)) / @as(f32, @floatFromInt(screen_dimensions.width));
-    const stride_vertical = @as(f32, @floatFromInt((dimensions_pixels.height + inner_margin_pixels) * 2)) / @as(f32, @floatFromInt(screen_dimensions.height));
-
-    var face_writer = quad_face_writer_pool.create(1, (vertices_range_size - 1) / @sizeOf(graphics.GenericVertex));
-
-    var faces = try face_writer.allocate(horizonal_count * vertical_count);
-    var horizonal_i: u32 = 0;
-    while(horizonal_i < horizonal_count) : (horizonal_i += 1) {
-        var vertical_i: u32 = 0;
-        while(vertical_i < vertical_count) : (vertical_i += 1) {
-            const extent = geometry.Extent2D(f32) {
-                .x = x_begin + (stride_horizonal * @as(f32, @floatFromInt(horizonal_i))),
-                .y = y_begin + (stride_vertical * @as(f32, @floatFromInt(vertical_i))),
-                .width = @as(f32, @floatFromInt(dimensions_pixels.width)) / @as(f32, @floatFromInt(screen_dimensions.width)) * 2.0,
-                .height = @as(f32, @floatFromInt(dimensions_pixels.height)) / @as(f32, @floatFromInt(screen_dimensions.height)) * 2.0,
-            };
-            const face_index = horizonal_i + (vertical_i * horizonal_count);
-            const texture_coordinates = iconTextureLookup(@enumFromInt(face_index % icon_path_list.len));
-            const texture_extent = geometry.Extent2D(f32) {
-                .x = texture_coordinates.x,
-                .y = texture_coordinates.y,
-                .width = @as(f32, @floatFromInt(icon_dimensions.width)) / @as(f32, @floatFromInt(texture_layer_dimensions.width)),
-                .height = @as(f32, @floatFromInt(icon_dimensions.height)) / @as(f32, @floatFromInt(texture_layer_dimensions.height)),
-            };
-            faces[face_index] = graphics.generateTexturedQuad(graphics.GenericVertex, extent, texture_extent, .top_left);
-        }
-    }
-    vertex_buffer_quad_count = 1 + (horizonal_count * vertical_count);
+    vertex_buffer_quad_count += 1;
 }
 
 fn setup(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
@@ -1776,8 +1864,6 @@ fn setup(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
         // TODO: Cleanup alignCasts
         const required_alignment = @alignOf(graphics.GenericVertex);
         const vertices_addr: [*]align(required_alignment) u8 = @ptrCast(@alignCast(&mapped_device_memory[vertices_range_index_begin]));
-        background_quad = @ptrCast(@alignCast(&vertices_addr[0]));
-        background_quad.* = graphics.generateQuadColored(graphics.GenericVertex, full_screen_extent, background_color_b[0].toRGBA(), .top_left);
         const vertices_quad_size: u32 = vertices_range_size / @sizeOf(graphics.GenericVertex);
         quad_face_writer_pool = QuadFaceWriterPool(graphics.GenericVertex).initialize(vertices_addr, vertices_quad_size);
     }
@@ -1861,11 +1947,15 @@ fn recreateSwapchain(allocator: std.mem.Allocator, app: *GraphicsContext) !void 
 
     _ = try app.device_dispatch.waitForFences(
         app.logical_device,
-        1,
-        @ptrCast(&app.inflight_fences[previous_frame]),
+        max_frames_in_flight,
+        @ptrCast(app.inflight_fences.ptr),
         vk.TRUE,
         std.math.maxInt(u64),
     );
+    // const wait_fences_end = std.time.nanoTimestamp();
+    // const wait_fences_duration = @as(u64, @intCast(wait_fences_end - recreate_swapchain_start));
+
+    // std.log.info("Fences awaited in {}", .{std.fmt.fmtDuration(wait_fences_duration)});
 
     for (app.swapchain_image_views) |image_view| {
         app.device_dispatch.destroyImageView(app.logical_device, image_view, null);
@@ -1875,6 +1965,10 @@ fn recreateSwapchain(allocator: std.mem.Allocator, app: *GraphicsContext) !void 
     app.swapchain_extent.height = screen_dimensions.height;
 
     const surface_capabilities = try app.instance_dispatch.getPhysicalDeviceSurfaceCapabilitiesKHR(app.physical_device, app.surface);
+
+    // std.log.info("swapchain min: {d}, {d}", .{surface_capabilities.min_image_extent.width, surface_capabilities.min_image_extent.height});
+    // std.log.info("swapchain max: {d}, {d}", .{surface_capabilities.max_image_extent.width, surface_capabilities.max_image_extent.height});
+    // std.log.info("screen dimensions: {d}, {d}", .{screen_dimensions.width, screen_dimensions.height});
 
     if(app.swapchain_extent.width < surface_capabilities.min_image_extent.width)
     {
@@ -1900,6 +1994,7 @@ fn recreateSwapchain(allocator: std.mem.Allocator, app: *GraphicsContext) !void 
     screen_dimensions.height = @intCast(app.swapchain_extent.height);
 
     const old_swapchain = app.swapchain;
+    // const swapchain_start = std.time.nanoTimestamp();
     app.swapchain = try app.device_dispatch.createSwapchainKHR(app.logical_device, &vk.SwapchainCreateInfoKHR{
         .surface = app.surface,
         .min_image_count = app.swapchain_min_image_count,
@@ -1918,6 +2013,9 @@ fn recreateSwapchain(allocator: std.mem.Allocator, app: *GraphicsContext) !void 
         .flags = .{},
         .old_swapchain = old_swapchain,
     }, null);
+    // const swapchain_end = std.time.nanoTimestamp();
+    // const swapchain_duration: u64 = @intCast(swapchain_end - swapchain_start);
+    // std.log.info("Actual swapchain create in {}", .{std.fmt.fmtDuration(swapchain_duration)});
 
     app.device_dispatch.destroySwapchainKHR(app.logical_device, old_swapchain, null);
 
@@ -1928,6 +2026,7 @@ fn recreateSwapchain(allocator: std.mem.Allocator, app: *GraphicsContext) !void 
         }
 
         if (image_count != app.swapchain_images.len) {
+            std.log.info("Warn: Relloc of swapchain images", .{});
             app.swapchain_images = try allocator.realloc(app.swapchain_images, image_count);
         }
     }
@@ -1974,8 +2073,6 @@ fn recordRenderPass(
 ) !void {
     std.debug.assert(app.command_buffers.len > 0);
     std.debug.assert(app.swapchain_images.len == app.command_buffers.len);
-    std.debug.assert(screen_dimensions.width == app.swapchain_extent.width);
-    std.debug.assert(screen_dimensions.height == app.swapchain_extent.height);
 
     _ = try app.device_dispatch.waitForFences(
         app.logical_device,
@@ -1987,15 +2084,11 @@ fn recordRenderPass(
 
     try app.device_dispatch.resetCommandPool(app.logical_device, app.command_pool, .{});
 
-    const current_time = std.time.milliTimestamp();
-    std.debug.assert(current_time >= background_color_loop_time_base);
-
-    // This value should never been seen, as we draw a background quad over it
     const clear_color = graphics.RGBA(f32){ 
         .r = 0.0,
         .g = 0.0,
         .b = 0.0,
-        .a = 1.0 - transparancy_level
+        .a = 1.0
     };
     const clear_colors = [1]vk.ClearValue{
         vk.ClearValue{
@@ -2092,13 +2185,28 @@ fn recordRenderPass(
 }
 
 fn renderFrame(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
-    _ = try app.device_dispatch.waitForFences(
-        app.logical_device,
-        1,
-        @ptrCast(&app.inflight_fences[current_frame]),
-        vk.TRUE,
-        std.math.maxInt(u64),
-    );
+
+    // _ = try app.device_dispatch.waitForFences(
+    //     app.logical_device,
+    //     1,
+    //     @ptrCast(&app.inflight_fences[current_frame]),
+    //     vk.TRUE,
+    //     std.math.maxInt(u64),
+    // );
+
+    if(framebuffer_resized) {
+        framebuffer_resized = false;
+        try recreateSwapchain(allocator, app);
+        try recordRenderPass(app.*, vertex_buffer_quad_count * 6);
+    } else {
+        _ = try app.device_dispatch.waitForFences(
+            app.logical_device,
+            1,
+            @ptrCast(&app.inflight_fences[current_frame]),
+            vk.TRUE,
+            std.math.maxInt(u64),
+        );
+    }
 
     const acquire_image_result = try app.device_dispatch.acquireNextImageKHR(
         app.logical_device,
@@ -2110,10 +2218,20 @@ fn renderFrame(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
 
     // https://www.khronos.org/registry/vulkan/specs/1.3-extensions/man/html/vkAcquireNextImageKHR.html
     switch(acquire_image_result.result) {
-        .success => {},
-        .error_out_of_date_khr, .suboptimal_khr => {
+        .success, .suboptimal_khr => {},
+        .error_out_of_date_khr => {
+            std.log.info("error_out_of_date_khr. Recreating swaphchain", .{});
             try recreateSwapchain(allocator, app);
-            return;
+            try recordRenderPass(app.*, vertex_buffer_quad_count * 6);
+            const acquire_image_result_2 = try app.device_dispatch.acquireNextImageKHR(
+                app.logical_device,
+                app.swapchain,
+                std.math.maxInt(u64),
+                app.images_available[current_frame],
+                .null_handle,
+            );
+            if(acquire_image_result_2.result != .success)
+                return;
         },
         .error_out_of_host_memory => { return error.VulkanHostOutOfMemory; },
         .error_out_of_device_memory => { return error.VulkanDeviceOutOfMemory; },
@@ -2166,9 +2284,12 @@ fn renderFrame(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
     // https://www.khronos.org/registry/vulkan/specs/1.3-extensions/man/html/vkQueuePresentKHR.html
     switch(present_result) {
         .success => {},
-        .error_out_of_date_khr, .suboptimal_khr => {
+        .error_out_of_date_khr => std.debug.assert(false), 
+        .suboptimal_khr => {
+            std.log.info("suboptimal_khr. Recreating swaphchain", .{});
             try recreateSwapchain(allocator, app);
-            return;
+            try recordRenderPass(app.*, vertex_buffer_quad_count * 6);
+            // return;
         },
         .error_out_of_host_memory => { return error.VulkanHostOutOfMemory; },
         .error_out_of_device_memory => { return error.VulkanDeviceOutOfMemory; },
@@ -2605,8 +2726,8 @@ fn createFramebuffers(allocator: std.mem.Allocator, app: GraphicsContext) ![]vk.
         .render_pass = app.render_pass,
         .attachment_count = 1,
         .p_attachments = undefined,
-        .width = screen_dimensions.width,
-        .height = screen_dimensions.height,
+        .width = app.swapchain_extent.width,
+        .height = app.swapchain_extent.height,
         .layers = 1,
         .flags = .{},
     };

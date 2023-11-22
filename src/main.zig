@@ -11,21 +11,6 @@ const shaders = @import("shaders");
 const win = std.os.windows;
 const user32 = win.user32;
 
-const MapChunk = struct {
-    obstacle_count: u32,
-    obstacle_index: u32,
-};
-
-const Player = struct {
-    const State = enum(u32) {
-        running,
-        jumping,
-    };
-    /// X position in current chunk
-    position_x: f32,
-    position_y: f32,
-};
-
 const Obstacles = struct {
     const Obstacle = struct {
         x: f32,
@@ -129,6 +114,8 @@ fn normalizeDist(absolute_px: f32, max_value: f32) f32 {
     return (absolute_px / max_value) * 2.0;
 }
 
+var game_lost: bool = false;
+
 fn needExtentGeometry() bool {
     const screen_width: f32 = @floatFromInt(screen_dimensions.width);
     const visible_x_offset: f32 = screen_offset_px + screen_width;
@@ -145,12 +132,45 @@ fn needExtentGeometry() bool {
 var cached_quads_to_render_count: usize = 0;
 
 var is_meshdraw_required: bool = true;
+const player_dimensions: geometry.Dimensions2D(f32) = .{
+    .width = 30,
+    .height = 40,
+};
 
 fn renderGame(time_delta: f32) !usize {
     var face_writer = quad_face_writer_pool.create(0, 50);
     const obs_color = graphics.RGBA(f32){ .r = 0.7, .g = 0.4, .b = 0.3, .a = 1.0 };
+    const screen_width: f32 = @floatFromInt(screen_dimensions.width);
+    const screen_height: f32 = @floatFromInt(screen_dimensions.height);
+    const obstacle_baseline_px: f32 = ground_height_px;
 
     screen_offset_px = time_delta * pixels_per_s;
+
+    const player_extent = geometry.Extent2D(f32){
+        .x = normalizePoint(player_position.x, screen_width),
+        .y = normalizePoint(player_position.y, screen_height),
+        .width = normalizeDist(player_dimensions.width, screen_width),
+        .height = normalizeDist(player_dimensions.height, screen_height),
+    };
+    const player_color = graphics.RGBA(f32){ .r = 0.1, .g = 0.8, .b = 0.1, .a = 1.0 };
+    (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, player_extent, player_color, .bottom_left);
+
+    const player_end_x: f32 = normalizeDist(screen_offset_px, screen_width) + player_extent.x + player_extent.width;
+    const player_bottom_y: f32 = player_extent.y;
+
+    for (obstacle_buffer.buffer) |obstacle| {
+        const obs_extent = geometry.Extent2D(f32){
+            .x = normalizePoint(obstacle.x, screen_width),
+            .y = normalizePoint(screen_height - obstacle_baseline_px, screen_height),
+            .width = normalizeDist(obstacle.width, screen_width),
+            .height = normalizeDist(obstacle.height, screen_height),
+        };
+        if (player_end_x > obs_extent.x and player_end_x < (obs_extent.x + obs_extent.width)) {
+            if (player_bottom_y > (obs_extent.y - obs_extent.height)) {
+                game_lost = true;
+            }
+        }
+    }
 
     if (needExtentGeometry()) {
         std.log.warn("Geometry needs to be extended", .{});
@@ -170,18 +190,6 @@ fn renderGame(time_delta: f32) !usize {
 
     is_meshdraw_required = false;
 
-    const player_extent = geometry.Extent2D(f32){
-        .x = -1.0 + (player_position.x / @as(f32, @floatFromInt(screen_dimensions.width))) * 2.0,
-        .y = -1.0 + (player_position.y / @as(f32, @floatFromInt(screen_dimensions.height)) * 2.0),
-        .width = (50.0 / @as(f32, @floatFromInt(screen_dimensions.width)) * 2.0),
-        .height = (50.0 / @as(f32, @floatFromInt(screen_dimensions.height)) * 2.0),
-    };
-    const player_color = graphics.RGBA(f32){ .r = 0.1, .g = 0.8, .b = 0.1, .a = 1.0 };
-    (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, player_extent, player_color, .top_left);
-
-    const screen_width: f32 = @floatFromInt(screen_dimensions.width);
-    const screen_height: f32 = @floatFromInt(screen_dimensions.height);
-
     const ground_color = graphics.RGBA(f32).fromInt(u8, 10, 200, 30, 255);
     const ground_extent = geometry.Extent2D(f32){
         .x = -1.0,
@@ -193,8 +201,6 @@ fn renderGame(time_delta: f32) !usize {
         .height = normalizeDist(ground_height_px, screen_height),
     };
     (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, ground_extent, ground_color, .bottom_left);
-
-    const obstacle_baseline_px: f32 = ground_height_px;
 
     for (obstacle_buffer.buffer) |obstacle| {
         const obs_extent = geometry.Extent2D(f32){
@@ -274,7 +280,7 @@ const print_vulkan_objects = struct {
 
 var player_position = geometry.Coordinates2D(f32){
     .x = 20.0,
-    .y = 20.0,
+    .y = 100.0,
 };
 
 var controls: packed struct {
@@ -1114,8 +1120,8 @@ fn appLoop(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
         if(controls.down) {
             player_position.y += velocity_pixels;
             const screen_height: f32 = @floatFromInt(screen_dimensions.height);
-            if((player_position.y + 50) > (screen_height - ground_height_px)) {
-                player_position.y = (screen_height - ground_height_px) - 50;
+            if((player_position.y) > (screen_height - ground_height_px)) {
+                player_position.y = (screen_height - ground_height_px);
             }
             std.log.info("Player Y: {d} screen height {d} ground {d}", .{player_position.y, screen_height, ground_height_px});
         }
@@ -1200,7 +1206,25 @@ var game_current_ts: i128 = 0;
 /// Our example draw function
 /// This will run anytime the screen is resized
 fn draw(time_delta_s: f32) !void {
-    vertex_buffer_quad_count = @intCast(try renderGame(time_delta_s));
+    if(!game_lost) {
+        vertex_buffer_quad_count = @intCast(try renderGame(time_delta_s));
+    }
+    else {
+        vertex_buffer_quad_count =  @intCast(try endGameScreen());
+    }
+}
+
+fn endGameScreen() !usize {
+    var face_writer = quad_face_writer_pool.create(0, 50);
+    const screen_background_color = graphics.RGBA(f32).fromInt(u8, 240, 20, 20, 255);
+    const screen_extent = geometry.Extent2D(f32){
+        .x = -1.0,
+        .y = -1.0,
+        .width = 2.0,
+        .height = 2.0,
+    };
+    (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, screen_extent, screen_background_color, .top_left);
+    return 1;
 }
 
 fn setup(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
@@ -2167,39 +2191,58 @@ fn recordRenderPass(
             undefined,
         );
 
-        {
-            const push_constant = PushConstant {
-                .x_offset = x_offset,
-                .y_offset = 0.0,
-            };
+        if(!game_lost) {
+            {
+                const push_constant = PushConstant {
+                    .x_offset = x_offset,
+                    .y_offset = 0.0,
+                };
 
-            app.device_dispatch.cmdPushConstants(
-                command_buffer,
-                app.pipeline_layout,
-                .{ .vertex_bit = true },
-                0,
-                @sizeOf(PushConstant),
-                &push_constant
-            );
+                app.device_dispatch.cmdPushConstants(
+                    command_buffer,
+                    app.pipeline_layout,
+                    .{ .vertex_bit = true },
+                    0,
+                    @sizeOf(PushConstant),
+                    &push_constant
+                );
+            }
+            app.device_dispatch.cmdDrawIndexed(command_buffer, indices_count - 12, 1, 12, 0, 0);
+
+            {
+                const push_constant = PushConstant {
+                    .x_offset = 0.0,
+                    .y_offset = 0.0,
+                };
+
+                app.device_dispatch.cmdPushConstants(
+                    command_buffer,
+                    app.pipeline_layout,
+                    .{ .vertex_bit = true },
+                    0,
+                    @sizeOf(PushConstant),
+                    &push_constant
+                );
+            }
+            app.device_dispatch.cmdDrawIndexed(command_buffer, 12, 1, 0, 0, 0);
+        } else {
+            {
+                const push_constant = PushConstant {
+                    .x_offset = 0.0,
+                    .y_offset = 0.0,
+                };
+
+                app.device_dispatch.cmdPushConstants(
+                    command_buffer,
+                    app.pipeline_layout,
+                    .{ .vertex_bit = true },
+                    0,
+                    @sizeOf(PushConstant),
+                    &push_constant
+                );
+            }
+            app.device_dispatch.cmdDrawIndexed(command_buffer, indices_count, 1, 0, 0, 0);
         }
-        app.device_dispatch.cmdDrawIndexed(command_buffer, indices_count - 12, 1, 12, 0, 0);
-
-        {
-            const push_constant = PushConstant {
-                .x_offset = 0.0,
-                .y_offset = 0.0,
-            };
-
-            app.device_dispatch.cmdPushConstants(
-                command_buffer,
-                app.pipeline_layout,
-                .{ .vertex_bit = true },
-                0,
-                @sizeOf(PushConstant),
-                &push_constant
-            );
-        }
-        app.device_dispatch.cmdDrawIndexed(command_buffer, 12, 1, 0, 0, 0);
 
         app.device_dispatch.cmdEndRenderPass(command_buffer);
         try app.device_dispatch.endCommandBuffer(command_buffer);

@@ -9,8 +9,7 @@ layout(location = 1) in vec4 inColor;
 layout(location = 0) out vec4 outColor;
 
 layout( push_constant ) uniform Block {
-    vec2 dimensions;
-    float frame;
+    vec2 player_offset;
 } PushConstant;
 
 void main() {

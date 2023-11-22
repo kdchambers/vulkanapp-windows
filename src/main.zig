@@ -122,12 +122,10 @@ var frame_width_px: f32 = 0;
 const ground_height_px: f32 = 40;
 
 fn normalizePoint(absolute_px: f32, max_value: f32) f32 {
-    assert(absolute_px <= max_value);
     return -1.0 + ((absolute_px / max_value) * 2.0);
 }
 
 fn normalizeDist(absolute_px: f32, max_value: f32) f32 {
-    assert(absolute_px <= max_value);
     return (absolute_px / max_value) * 2.0;
 }
 
@@ -146,6 +144,8 @@ fn needExtentGeometry() bool {
 //
 var cached_quads_to_render_count: usize = 0;
 
+var is_meshdraw_required: bool = true;
+
 fn renderGame(time_delta: f32) !usize {
     var face_writer = quad_face_writer_pool.create(0, 50);
     const obs_color = graphics.RGBA(f32){ .r = 0.7, .g = 0.4, .b = 0.3, .a = 1.0 };
@@ -160,7 +160,24 @@ fn renderGame(time_delta: f32) !usize {
         frame_offset_px = obstacle_buffer.frameStart();
 
         assert(!needExtentGeometry());
+
+        is_meshdraw_required = true;
     }
+
+    if (!is_meshdraw_required) {
+        return cached_quads_to_render_count;
+    }
+
+    is_meshdraw_required = false;
+
+    const player_extent = geometry.Extent2D(f32){
+        .x = -1.0 + (player_position.x / @as(f32, @floatFromInt(screen_dimensions.width))) * 2.0,
+        .y = -1.0 + (player_position.y / @as(f32, @floatFromInt(screen_dimensions.height)) * 2.0),
+        .width = (50.0 / @as(f32, @floatFromInt(screen_dimensions.width)) * 2.0),
+        .height = (50.0 / @as(f32, @floatFromInt(screen_dimensions.height)) * 2.0),
+    };
+    const player_color = graphics.RGBA(f32){ .r = 0.1, .g = 0.8, .b = 0.1, .a = 1.0 };
+    (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, player_extent, player_color, .top_left);
 
     const screen_width: f32 = @floatFromInt(screen_dimensions.width);
     const screen_height: f32 = @floatFromInt(screen_dimensions.height);
@@ -169,19 +186,19 @@ fn renderGame(time_delta: f32) !usize {
     const ground_extent = geometry.Extent2D(f32){
         .x = -1.0,
         .y = 1.0,
-        .width = 2.0,
+        //
+        // TODO: needExtentGeometry is wrong, this 200 buffer shouldn't be needed
+        //
+        .width = normalizeDist(frame_width_px, screen_width + 200),
         .height = normalizeDist(ground_height_px, screen_height),
     };
     (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, ground_extent, ground_color, .bottom_left);
 
-    vertex_buffer_quad_count += 1;
-
     const obstacle_baseline_px: f32 = ground_height_px;
-    const obstacles = obstacle_buffer.visibleObstacles(screen_offset_px, screen_width);
 
-    for (obstacles) |obstacle| {
+    for (obstacle_buffer.buffer) |obstacle| {
         const obs_extent = geometry.Extent2D(f32){
-            .x = normalizePoint(obstacle.x - screen_offset_px, screen_width),
+            .x = normalizePoint(obstacle.x, screen_width),
             .y = normalizePoint(screen_height - obstacle_baseline_px, screen_height),
             .width = normalizeDist(obstacle.width, screen_width),
             .height = normalizeDist(obstacle.height, screen_height),
@@ -189,12 +206,12 @@ fn renderGame(time_delta: f32) !usize {
         (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, obs_extent, obs_color, .bottom_left);
     }
 
-    cached_quads_to_render_count = obstacles.len + 1;
+    cached_quads_to_render_count = obstacle_buffer.buffer.len + 2;
     return cached_quads_to_render_count;
 }
 
 //
-// This is a pretty bad hack, I should just load windows headers
+// This is a hack, I should just load windows headers
 //
 
 extern fn LoadCursorW(hwnd: ?win.HINSTANCE, lpCursorName: [*:0]const u16) callconv(.C) win.HCURSOR;
@@ -740,10 +757,9 @@ const geometry = struct {
 };
 
 /// Push constant structure that is used in our fragment shader
-const PushConstant = packed struct {
-    width: f32,
-    height: f32,
-    frame: f32,
+const PushConstant = extern struct {
+    x_offset: f32,
+    y_offset: f32,
 };
 
 var is_mouse_button_down: bool = false;
@@ -1185,20 +1201,6 @@ var game_current_ts: i128 = 0;
 /// This will run anytime the screen is resized
 fn draw(time_delta_s: f32) !void {
     vertex_buffer_quad_count = @intCast(try renderGame(time_delta_s));
-    const player_extent = geometry.Extent2D(f32) {
-        .x = -1.0 + (player_position.x / @as(f32, @floatFromInt(screen_dimensions.width))) * 2.0,
-        .y = -1.0 + (player_position.y / @as(f32, @floatFromInt(screen_dimensions.height)) * 2.0),
-        .width = (50.0 / @as(f32, @floatFromInt(screen_dimensions.width)) * 2.0),
-        .height = (50.0 / @as(f32, @floatFromInt(screen_dimensions.height)) * 2.0),
-    };
-
-    var face_writer = quad_face_writer_pool.create(@intCast(vertex_buffer_quad_count), 1);
-
-    const player_color = graphics.RGBA(f32){ .r = 0.1, .g = 0.8, .b = 0.1, .a = 1.0 };
-
-    (try face_writer.create()).* = graphics.generateQuadColored(graphics.GenericVertex, player_extent, player_color, .top_left);
-
-    vertex_buffer_quad_count += 1;
 }
 
 fn setup(allocator: std.mem.Allocator, app: *GraphicsContext) !void {
@@ -2098,6 +2100,9 @@ fn recordRenderPass(
         },
     };
 
+    const screen_width_px: f32 = @floatFromInt(screen_dimensions.width);
+    const x_offset: f32 = (screen_offset_px / screen_width_px) * 2.0;
+
     for (app.command_buffers, 0..) |command_buffer, i| {
         try app.device_dispatch.beginCommandBuffer(command_buffer, &vk.CommandBufferBeginInfo{
             .flags = .{},
@@ -2152,32 +2157,49 @@ fn recordRenderPass(
         app.device_dispatch.cmdBindVertexBuffers(command_buffer, 0, 1, &[1]vk.Buffer{texture_vertices_buffer}, &[1]vk.DeviceSize{0});
         app.device_dispatch.cmdBindIndexBuffer(command_buffer, texture_indices_buffer, 0, .uint16);
         app.device_dispatch.cmdBindDescriptorSets(
-            command_buffer, 
+            command_buffer,
             .graphics, 
-            app.pipeline_layout, 
-            0, 
-            1, 
-            &[1]vk.DescriptorSet{app.descriptor_sets[i]}, 
-            0, 
+            app.pipeline_layout,
+            0,
+            1,
+            &[1]vk.DescriptorSet{app.descriptor_sets[i]},
+            0,
             undefined,
         );
-        
-        const push_constant = PushConstant {
-            .width = @floatFromInt(screen_dimensions.width),       
-            .height = @floatFromInt(screen_dimensions.height),
-            .frame = @floatFromInt(frame_count),
-        };
-       
-        app.device_dispatch.cmdPushConstants(
-            command_buffer, 
-            app.pipeline_layout, 
-            .{ .fragment_bit = true }, 
-            0, 
-            @sizeOf(PushConstant), 
-            &push_constant
-        );
 
-        app.device_dispatch.cmdDrawIndexed(command_buffer, indices_count, 1, 0, 0, 0);
+        {
+            const push_constant = PushConstant {
+                .x_offset = x_offset,
+                .y_offset = 0.0,
+            };
+
+            app.device_dispatch.cmdPushConstants(
+                command_buffer,
+                app.pipeline_layout,
+                .{ .vertex_bit = true },
+                0,
+                @sizeOf(PushConstant),
+                &push_constant
+            );
+        }
+        app.device_dispatch.cmdDrawIndexed(command_buffer, indices_count - 12, 1, 12, 0, 0);
+
+        {
+            const push_constant = PushConstant {
+                .x_offset = 0.0,
+                .y_offset = 0.0,
+            };
+
+            app.device_dispatch.cmdPushConstants(
+                command_buffer,
+                app.pipeline_layout,
+                .{ .vertex_bit = true },
+                0,
+                @sizeOf(PushConstant),
+                &push_constant
+            );
+        }
+        app.device_dispatch.cmdDrawIndexed(command_buffer, 12, 1, 0, 0, 0);
 
         app.device_dispatch.cmdEndRenderPass(command_buffer);
         try app.device_dispatch.endCommandBuffer(command_buffer);
@@ -2505,7 +2527,7 @@ fn createDescriptorSets(
 
 fn createPipelineLayout(app: GraphicsContext, descriptor_set_layouts: []vk.DescriptorSetLayout) !vk.PipelineLayout {
     const push_constant = vk.PushConstantRange {
-        .stage_flags = .{ .fragment_bit = true },
+        .stage_flags = .{ .vertex_bit = true },
         .offset = 0,
         .size = @sizeOf(PushConstant),
     };
